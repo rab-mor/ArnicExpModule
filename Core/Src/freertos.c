@@ -25,7 +25,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "app_shared.h"
+#include "exp_tasks.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,7 +46,31 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+/* LinkTask (RS485) runs inside defaultTask; see StartDefaultTask(). */
+osThreadId_t LinkTaskHandle;
 
+osThreadId_t RelayTaskHandle;
+static const osThreadAttr_t RelayTask_attributes = {
+  .name = "RelayTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+
+osThreadId_t MeasureTaskHandle;
+static const osThreadAttr_t MeasureTask_attributes = {
+  .name = "MeasureTask",
+  .stack_size = 384 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+osThreadId_t SupervisorTaskHandle;
+static const osThreadAttr_t SupervisorTask_attributes = {
+  .name = "SupervisorTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+
+osMessageQueueId_t relay_cmd_qHandle;
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -99,7 +124,7 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_TIMERS */
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
+  relay_cmd_qHandle = osMessageQueueNew(8, sizeof(relay_cmd_t), NULL);
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -107,7 +132,9 @@ void MX_FREERTOS_Init(void) {
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  RelayTaskHandle      = osThreadNew(RelayTask_Run,      NULL, &RelayTask_attributes);
+  MeasureTaskHandle    = osThreadNew(MeasureTask_Run,    NULL, &MeasureTask_attributes);
+  SupervisorTaskHandle = osThreadNew(SupervisorTask_Run, NULL, &SupervisorTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -126,10 +153,12 @@ void MX_FREERTOS_Init(void) {
 void StartDefaultTask(void *argument)
 {
   /* USER CODE BEGIN StartDefaultTask */
-  /* Infinite loop */
+  /* defaultTask is LinkTask: the RS485 slave (rs485_slave.c). */
+  LinkTaskHandle = osThreadGetId();
+  Rs485Slave_Run(argument);     /* never returns */
   for(;;)
   {
-    osDelay(1);
+    osDelay(1000);
   }
   /* USER CODE END StartDefaultTask */
 }
