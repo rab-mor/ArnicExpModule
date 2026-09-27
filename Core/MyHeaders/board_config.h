@@ -20,6 +20,7 @@
  * ==================================================================== */
 
 #define BOARD_TYPE_EXPANSION    1U
+#define F1_THIS_BOARD           BOARD_TYPE_EXPANSION    /* F1_BOARD_EXPANSION (f1_image.h) */
 #define FW_VERSION_MAJOR        1U
 #define FW_VERSION_MINOR        0U
 
