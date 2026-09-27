@@ -2,7 +2,8 @@
  * exp_tasks.h - F103 expansion module header file
  *
  * Task entry points and live stats. Tasks are created in freertos.c
- * (USER CODE BEGIN RTOS_THREADS); LinkTask runs inside CubeMX's defaultTask.
+ * (USER CODE BEGIN RTOS_THREADS). CubeMX's defaultTask only exits: its
+ * 512-byte stack is too small for LinkTask, which has its own now.
  *
  * Ownership:
  *   LinkTask       - USART1 / RS485: answers the H7, queues relay commands,
@@ -82,6 +83,9 @@ typedef struct {
     uint32_t cmds_busy;
     uint32_t events_dropped; /* event buffer full: oldest dropped           */
     uint32_t last_request_ms;
+    uint32_t windows_sent;   /* measurement windows carried in replies      */
+    uint32_t ota_requests;
+    uint32_t baud_fixed;     /* 1 = usart.c had another baud rate           */
 } link_dbg_t;
 
 extern link_dbg_t g_link_dbg;

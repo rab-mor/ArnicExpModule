@@ -59,6 +59,7 @@
 #include "relays.h"
 #include "cmsis_os2.h"
 #include "app_shared.h"
+#include "harmonics.h"
 #include <math.h>
 #include <string.h>
 
@@ -150,6 +151,17 @@ static void accumulate(const uint32_t *words, uint32_t triggers)
             const uint32_t w = scan[r];
             acc_add(&s_acc[k_rank_lo[r] - 1U],  w         & 0x0FFFU);  /* ADC1 */
             acc_add(&s_acc[k_rank_hi[r] - 1U], (w >> 16)  & 0x0FFFU);  /* ADC2 */
+        }
+
+        /* One capture a second: the same samples, by relay, to the
+           harmonic detectors. Current sensor N measures relay N. */
+        if (harm_capturing()) {
+            uint16_t x[RELAY_COUNT];
+            for (uint32_t r = 0U; r < ADC_CURRENT_RANKS; r++) {
+                x[k_rank_lo[r] - 1U] = (uint16_t)( scan[r]        & 0x0FFFU);
+                x[k_rank_hi[r] - 1U] = (uint16_t)((scan[r] >> 16) & 0x0FFFU);
+            }
+            harm_feed(x);
         }
 
         /* Rank 7: 5 V on ADC1 (low), 24 V on ADC2 (high). */

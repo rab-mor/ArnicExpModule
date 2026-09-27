@@ -20,6 +20,8 @@
 #include "app_shared.h"
 #include "relays.h"
 #include "current_sense.h"
+#include "harmonics.h"
+#include "win_ring.h"
 #include "exp_tasks.h"
 
 extern ADC_HandleTypeDef hadc1;
@@ -51,6 +53,8 @@ static void publish(app_snapshot_t *next)
 
     __DMB();                                        /* contents before the flip */
     g_snap_active = (uint8_t)(1u - g_snap_active);
+
+    win_push(next->window_id, next->relay_ma);     /* kept until the H7 has it */
 }
 
 static void publish_fault(uint8_t faults)
@@ -79,6 +83,7 @@ void MeasureTask_Run(void *argument)
     (void)argument;
 
     sense_init();
+    harm_init();
     g_measure_dbg.start_rc = (int32_t)sense_start(&hadc1, &hadc2, &htim3);
 
     if (g_measure_dbg.start_rc != 0) {
@@ -97,6 +102,7 @@ void MeasureTask_Run(void *argument)
         g_hb_measure++;
 
         const uint32_t now = HAL_GetTick();
+        harm_service(now);              /* starts / finishes a harmonics capture */
 
         if (sense_service() != 0u) {
             last_window = now;

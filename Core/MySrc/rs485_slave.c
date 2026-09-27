@@ -21,6 +21,12 @@
  *   - A relay command whose cmd_seq matches the last one accepted for that
  *     relay is a retry of a command whose reply was lost: it is answered
  *     DUPLICATE and not queued again.
+ *   - Measurement windows (win_ring.c) likewise: every status reply carries
+ *     the windows after the H7's win_ack, so none is lost between polls.
+ *   - The H7's line frequency (f0 in every request) goes to the harmonic
+ *     detectors; HARMONICS requests return the newest set (harmonics.c).
+ *   - OTA requests go to f1_ota.c. After the reply to a successful END, the
+ *     module resets into the bootloader, which installs the update.
  */
 
 #include <string.h>
@@ -33,6 +39,9 @@
 #include "app_shared.h"
 #include "rs485_proto.h"
 #include "exp_tasks.h"
+#include "win_ring.h"
+#include "harmonics.h"
+#include "f1_ota.h"
 
 #define RX_DMA_BYTES        512u
 #define EVT_RING            8u          /* > RS485_EVENTS_MAX: room while unacked */
@@ -61,6 +70,13 @@ static uint16_t        s_evt_dropped;
 
 static uint16_t        s_last_seq[RELAY_COUNT];
 static bool            s_have_seq[RELAY_COUNT];
+
+/* Too big for LinkTask's stack. */
+static rs485_status_t  s_st;
+static harm_set_t      s_harm;
+static rs485_harm_part_t s_hpart;
+
+static bool            s_reboot;        /* OTA END accepted: reset after the reply */
 
 /* ------------------------------- Events ---------------------------------- */
 
@@ -181,41 +197,96 @@ static void send(uint16_t n)
 
 /* ------------------------------- Replies --------------------------------- */
 
-static uint8_t build_status(uint8_t cmd_result)
+_Static_assert(RELAY_COUNT == RS485_RELAYS_PER_MODULE, "window layout assumes 12 relays");
+
+static uint8_t build_status(uint8_t cmd_result, uint32_t win_ack)
 {
     const app_snapshot_t *snap = &g_snap[g_snap_active];
-    rs485_status_t st;
-    memset(&st, 0, sizeof(st));
+    rs485_status_t *st = &s_st;
+    memset(st, 0, sizeof(*st));
 
-    st.nonce     = s_nonce;
-    st.window_id = snap->window_id;
-    for (uint8_t k = 0u; k < RELAY_COUNT && k < RS485_RELAYS_PER_MODULE; k++) {
-        int32_t ma = snap->relay_ma[k];
-        if (ma >  32767) { ma =  32767; }
-        if (ma < -32768) { ma = -32768; }
-        st.relay_ma[k] = (int16_t)ma;
-    }
-    st.rail_24v_mv    = snap->rail_24V_mv;
-    st.rail_5v_mv     = snap->rail_5V_mv;
-    st.relay_state    = snap->relay_state;
-    st.relay_known    = snap->relay_known;
-    st.relay_evidence = snap->relay_evidence;
-    st.fault_flags    = snap->fault_flags;
-    st.store_flags    = snap->store_flags;
-    st.cmd_result     = cmd_result;
+    st->nonce          = s_nonce;
+    st->window_id      = snap->window_id;
+    st->rail_24v_mv    = snap->rail_24V_mv;
+    st->rail_5v_mv     = snap->rail_5V_mv;
+    st->relay_state    = snap->relay_state;
+    st->relay_known    = snap->relay_known;
+    st->relay_evidence = snap->relay_evidence;
+    st->fault_flags    = snap->fault_flags;
+    st->store_flags    = snap->store_flags;
+    st->cmd_result     = cmd_result;
+    st->harm_set_id    = harm_latest_id();
 
     taskENTER_CRITICAL();
-    st.dropped_events = s_evt_dropped;
+    st->dropped_events = s_evt_dropped;
     uint8_t n = s_evt_count;
     if (n > RS485_EVENTS_MAX) { n = RS485_EVENTS_MAX; }
     for (uint8_t e = 0u; e < n; e++) {
-        st.events[e] = s_evt[(s_evt_head + e) % EVT_RING];
+        st->events[e] = s_evt[(s_evt_head + e) % EVT_RING];
     }
-    st.event_count = n;
+    st->event_count = n;
     taskEXIT_CRITICAL();
 
-    g_link_dbg.events_dropped = st.dropped_events;
-    return rs485_encode_status(s_payload, &st);
+    /* As many unacknowledged windows as fit next to the events. */
+    st->win_count = win_collect(win_ack, rs485_win_room(n), &st->win_first_id, st->win_ma);
+
+    g_link_dbg.events_dropped = st->dropped_events;
+    g_link_dbg.windows_sent  += st->win_count;
+    return rs485_encode_status(s_payload, st);
+}
+
+/* The newest harmonics set: only relays carrying current, RS485_HARM_PER_PART
+   of them per part. */
+static uint8_t build_harm(uint8_t part)
+{
+    rs485_harm_part_t *hp = &s_hpart;
+    memset(hp, 0, sizeof(*hp));
+    hp->part = part;
+
+    if (harm_get(&s_harm)) {
+        hp->set_id      = s_harm.set_id;
+        hp->f0_centi_hz = s_harm.f0_centi_hz;
+        const uint32_t first = (uint32_t)part * RS485_HARM_PER_PART;
+        for (uint8_t r = 0u; r < RELAY_COUNT; r++) {
+            const harm_rec_t *h = &s_harm.rec[r];
+            if (h->h1_ma < HARM_MIN_H1_MA) {
+                continue;
+            }
+            if (hp->total >= first && hp->count < RS485_HARM_PER_PART) {
+                rs485_harm_rec_t *o = &hp->rec[hp->count++];
+                o->relay = r;
+                o->h1_ma = h->h1_ma;
+                for (uint8_t k = 0u; k < RS485_HARM_RATIOS; k++) {
+                    o->ratio[k] = h->ratio[k];
+                    o->phase[k] = h->phase[k];
+                }
+            }
+            hp->total++;
+        }
+    }
+    return rs485_encode_harm_part(s_payload, hp);
+}
+
+_Static_assert(RS485_OTA_QUERY == F1OTA_OP_QUERY && RS485_OTA_BEGIN == F1OTA_OP_BEGIN &&
+               RS485_OTA_DATA == F1OTA_OP_DATA && RS485_OTA_END == F1OTA_OP_END &&
+               RS485_OTA_ABORT == F1OTA_OP_ABORT, "OTA op numbers must match f1_ota.h");
+
+/* Firmware update step. Flash work happens here, before the reply: a page
+   erase holds the CPU for up to 40 ms, which the H7's OTA timeout allows. */
+static uint8_t handle_ota(const rs485_ota_req_t *r)
+{
+    const uint8_t res = f1_ota_request(r->op, r->offset, r->data, r->len, &s_reboot);
+    g_link_dbg.ota_requests++;
+
+    const rs485_ota_status_t st = {
+        .op_seq      = r->op_seq,
+        .result      = res,
+        .state       = f1_ota_state(),
+        .board_type  = (uint8_t)F1_THIS_BOARD,
+        .next_offset = f1_ota_next(),
+        .fw_version  = (uint16_t)((FW_VERSION_MAJOR << 8) | FW_VERSION_MINOR),
+    };
+    return rs485_encode_ota_status(s_payload, &st);
 }
 
 static uint8_t build_info(void)
@@ -267,32 +338,45 @@ static void handle_frame(const rs485_frame_t *f)
     make_nonce();
     HAL_GPIO_TogglePin(LED_G_GPIO_Port, LED_G_Pin);   /* activity */
 
+    /* Every request starts with the same header: event acks, window ack and
+       the line frequency. */
+    rs485_req_hdr_t h;
+    if (!rs485_decode_req_hdr(f->payload, f->len, &h)) {
+        return;
+    }
+    events_ack(&h);
+    harm_set_f0(h.f0_centi_hz);
+
     uint8_t len = 0u;
     switch (f->type) {
-        case RS485_MSG_PING: {
-            rs485_req_hdr_t h;
-            if (rs485_decode_req_hdr(f->payload, f->len, &h)) {
-                events_ack(&h);
-            }
+        case RS485_MSG_PING:
             len = build_info();
             break;
-        }
-        case RS485_MSG_STATUS: {
-            rs485_req_hdr_t h;
-            if (!rs485_decode_req_hdr(f->payload, f->len, &h)) {
-                return;
-            }
-            events_ack(&h);
-            len = build_status(RS485_CMD_NONE);
+        case RS485_MSG_STATUS:
+            len = build_status(RS485_CMD_NONE, h.win_ack);
             break;
-        }
         case RS485_MSG_RELAY: {
             rs485_relay_req_t r;
             if (!rs485_decode_relay_req(f->payload, f->len, &r)) {
                 return;
             }
-            events_ack(&r.hdr);
-            len = build_status(handle_relay(&r));
+            len = build_status(handle_relay(&r), h.win_ack);
+            break;
+        }
+        case RS485_MSG_HARMONICS: {
+            rs485_harm_req_t r;
+            if (!rs485_decode_harm_req(f->payload, f->len, &r)) {
+                return;
+            }
+            len = build_harm(r.part);
+            break;
+        }
+        case RS485_MSG_OTA: {
+            rs485_ota_req_t r;
+            if (!rs485_decode_ota_req(f->payload, f->len, &r)) {
+                return;
+            }
+            len = handle_ota(&r);
             break;
         }
         default:
@@ -303,6 +387,10 @@ static void handle_frame(const rs485_frame_t *f)
                                    f->seq, s_payload, len);
     if (n > 0u) {
         send(n);
+    }
+
+    if (s_reboot) {
+        f1_ota_reboot(&g_hb_link);      /* the reply is out: install the update */
     }
 }
 
@@ -331,6 +419,14 @@ void Rs485Slave_Run(void *argument)
     osDelay(10u);                       /* DIP lines settle on their pull-ups */
     s_addr = read_dip();
     g_link_dbg.addr = s_addr;
+
+    /* The baud rate is part of the protocol (rs485_proto.h): if CubeMX ever
+       generates something else, use the protocol's anyway. */
+    if (huart1.Init.BaudRate != RS485_BAUD) {
+        huart1.Init.BaudRate = RS485_BAUD;
+        (void)HAL_UART_Init(&huart1);
+        g_link_dbg.baud_fixed = 1u;
+    }
 
     rx_start();
 
