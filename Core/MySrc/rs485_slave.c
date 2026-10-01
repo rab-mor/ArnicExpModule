@@ -119,10 +119,10 @@ static void events_ack(const rs485_req_hdr_t *h)
 static uint8_t read_dip(void)
 {
     uint8_t a = 0u;
-    if (HAL_GPIO_ReadPin(DIP_1_GPIO_Port, DIP_1_Pin) == GPIO_PIN_RESET) { a |= 1u; }
-    if (HAL_GPIO_ReadPin(DIP_2_GPIO_Port, DIP_2_Pin) == GPIO_PIN_RESET) { a |= 2u; }
-    if (HAL_GPIO_ReadPin(DIP_3_GPIO_Port, DIP_3_Pin) == GPIO_PIN_RESET) { a |= 4u; }
-    if (HAL_GPIO_ReadPin(DIP_4_GPIO_Port, DIP_4_Pin) == GPIO_PIN_RESET) { a |= 8u; }
+    if (HAL_GPIO_ReadPin(DIP_1_GPIO_Port, DIP_1_Pin) == GPIO_PIN_SET) { a |= 1u; }
+    if (HAL_GPIO_ReadPin(DIP_2_GPIO_Port, DIP_2_Pin) == GPIO_PIN_SET) { a |= 2u; }
+    if (HAL_GPIO_ReadPin(DIP_3_GPIO_Port, DIP_3_Pin) == GPIO_PIN_SET) { a |= 4u; }
+    if (HAL_GPIO_ReadPin(DIP_4_GPIO_Port, DIP_4_Pin) == GPIO_PIN_SET) { a |= 8u; }
     return a;
 }
 
